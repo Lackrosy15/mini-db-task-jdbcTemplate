@@ -120,6 +120,7 @@ public class DAO {
         return equipments;
     }
 
+//TODO
     public Long addWorker(String firstName, String lastName, String info, String equipment) throws JsonProcessingException, SQLException {
         Map<String, Object> stringObjectMap = convertToInfoObject(info);
         PGobject jsonbObject = new PGobject();
