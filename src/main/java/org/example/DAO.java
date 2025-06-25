@@ -10,6 +10,8 @@ import org.postgresql.util.PGobject;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -21,6 +23,7 @@ public class DAO {
     private final JdbcTemplate jdbcTemplate;
     private final TransactionTemplate transactionTemplate;
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private static final Logger logger = LoggerFactory.getLogger(DAO.class);
 
     public DAO() throws IOException {
         Properties properties = new Properties();
@@ -42,90 +45,98 @@ public class DAO {
 
 
     public List<Equipment> getAllEquipments() {
-        String sql = "SELECT e.id AS equipment_id, e.description, c.id AS configuration_id, c.name AS configuration_name, c.value " +
-                "AS configuration_value, w.id AS worker_id, w.firstname, w.lastname, w.info " +
+        String sql = "SELECT e.id AS equipment_id, e.description, c.id AS configuration_id, c.name AS configuration_name, c.value AS configuration_value, w.id AS worker_id, w.firstname, w.lastname, w.info " +
                 "FROM \"jdbc-template\".equipments e LEFT JOIN \"jdbc-template\".configurations c ON e.id = c.equipmentid " +
                 "LEFT JOIN \"jdbc-template\".workers w ON e.id = w.equipmentid";
 
-        List<Equipment> equipments = new ArrayList<>();
+        Map<Long, Equipment> equipmentMap = new HashMap<>();
 
-        List<Equipment> result = jdbcTemplate.query(sql,
-                (rs, rowNum) -> { //запрос на получение всех станков с их конфигурациями и сотрудниками
+        jdbcTemplate.query(sql, rs -> {
+            Long equipmentId = rs.getLong("equipment_id");
+            if (rs.wasNull()) return;
 
-                    Equipment equipment = new Equipment(); //создаем пустой объект
+            Equipment equipment = equipmentMap.computeIfAbsent(equipmentId, id -> {
+                Equipment eq = new Equipment();
+                eq.setId(id);
+                eq.setDescription("description");
+                eq.setConfigurations(new ArrayList<>());
+                eq.setWorkers(new ArrayList<>());
+                return eq;
+            });
 
-//получаем все поля из каждой строки результирующего сета
-
-                    Long equipmentId = rs.getLong("equipment_id");
-                    String description = rs.getString("description");
-
-                    Long configurationId = rs.getLong("configuration_id");
-                    String configurationName = rs.getString("configuration_name");
-                    String configurationValue = rs.getString("configuration_value");
-
-                    Long workerId = rs.getLong("worker_id");
-                    String workerFirstName = rs.getString("firstname");
-                    String workerLastName = rs.getString("lastname");
-
-                    Map<String, Object> workerInfo = null;
-//парсим в мапу инфо сотрудника, если не пусто
-                    try {
-                        String info = rs.getString("info");
-
-                        if (info != null) {
-                            workerInfo = objectMapper.readValue(info, new TypeReference<Map<String, Object>>() {
-                            });
-                        }
-                    } catch (Exception e) {
-                        throw new RuntimeException("Failed to parse JSON", e);
-                    }
-
-//проверяем, есть ли уже станок в основном листе
-                    Optional<Equipment> optionalEquipment = equipments.stream().filter(eq -> eq.getId().equals(equipmentId)).findFirst();
-
-//если нет, то создаем новый и добавляем конфигурацию и сотрудника, если они заполнены, заполняем пустой объект станка и добавляем в основной лист
-                    if (!optionalEquipment.isPresent()) {
-                        equipment.setId(equipmentId);
-                        equipment.setDescription(description);
-                        equipment.setConfigurations(new ArrayList<>());
-                        equipment.setWorkers(new ArrayList<>());
-                        if (configurationId != 0) {
-                            Configuration configuration = new Configuration(configurationId, configurationName, configurationValue, equipmentId);
-                            equipment.getConfigurations().add(configuration);
-                        }
-                        if (workerId != 0) {
-                            Worker worker = new Worker(workerId, workerFirstName, workerLastName, equipmentId, workerInfo);
-                            equipment.getWorkers().add(worker);
-                        }
-                        equipments.add(equipment);
-//если станок уже есть, обновляем новой конфигурацией и добавляем сотрудника, если они есть в строке, возвращаем в результат найденный обновленный станок
-                    } else {
-                        if (configurationId != 0) {
-                            Configuration configuration = new Configuration(configurationId, configurationName, configurationValue, equipmentId);
-                            optionalEquipment.get().getConfigurations().add(configuration);
-                        }
-//Ищем в списке сотрудников, работающих на станке, есть ли уже такой сотрудник. Если есть, то не добавляем такого же.
-                        Optional<Worker> optionalWorker = optionalEquipment.get().getWorkers().stream().filter(worker -> worker.getId().equals(workerId)).findFirst();
-                        if (!optionalWorker.isPresent()) {
-                            Worker worker = new Worker(workerId, workerFirstName, workerLastName, equipmentId, workerInfo);
-                            optionalEquipment.get().getWorkers().add(worker);
-                        }
-                        equipment = optionalEquipment.get();
-                    }
-                    return equipment;
+            Long configurationId = rs.getLong("configuration_id");
+            if (!rs.wasNull()) {
+                Configuration config = createConfiguration(rs, configurationId, equipmentId);
+                if (config != null) {
+                    equipment.getConfigurations().add(config);
                 }
-        );
+            }
 
-        System.out.println(equipments);
-        return equipments;
+            Long workerId = rs.getLong("worker_id");
+            if (!rs.wasNull()) {
+                boolean existsWorker = equipment.getWorkers().stream().anyMatch(w -> w.getId().equals(workerId));
+                if (!existsWorker) {
+                    Worker worker = createWorker(rs, workerId, equipmentId);
+                    if (worker != null) {
+                        equipment.getWorkers().add(worker);
+                    }
+                }
+            }
+        });
+
+        System.out.println(equipmentMap.values());
+        return new ArrayList<>(equipmentMap.values());
+    }
+
+
+    // метод для создания Configuration
+    private Configuration createConfiguration(java.sql.ResultSet rs, Long configurationId, Long equipmentId) {
+        try {
+            Configuration config = new Configuration(
+                    configurationId,
+                    rs.getString("configuration_name"),
+                    rs.getString("configuration_value"),
+                    equipmentId
+            );
+            return config;
+        } catch (Exception e) {
+            logger.error("Ошибка создания Configuration: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    // Вспомогательный метод для создания Worker
+    private Worker createWorker(java.sql.ResultSet rs, Long workerId, Long equipmentId) throws SQLException {
+        Map<String, Object> workerInfo = null;
+        String info = rs.getString("info");
+        if (info != null) {
+            try {
+                workerInfo = objectMapper.readValue(info, new TypeReference<Map<String, Object>>() {});
+            } catch (Exception e) {
+                logger.warn("Ошибка парсинга info для Worker id {}: {}", workerId, e.getMessage());
+            }
+        }
+        try {
+            Worker worker = new Worker(
+                    workerId,
+                    rs.getString("firstname"),
+                    rs.getString("lastname"),
+                    equipmentId,
+                    workerInfo
+            );
+            return worker;
+        } catch (Exception e) {
+            logger.error("Ошибка создания Worker: {}", e.getMessage());
+            return null;
+        }
     }
 
 //TODO
     public Long addWorker(String firstName, String lastName, String info, String equipment) throws JsonProcessingException, SQLException {
         Map<String, Object> stringObjectMap = convertToInfoObject(info);
-        PGobject jsonbObject = new PGobject();
-        jsonbObject.setType("jsonb");
-        jsonbObject.setValue(objectMapper.writeValueAsString(stringObjectMap));
+        PGobject jsonbObjectInfo = new PGobject();
+        jsonbObjectInfo.setType("jsonb");
+        jsonbObjectInfo.setValue(objectMapper.writeValueAsString(stringObjectMap));
 
         return 1L;
     }
